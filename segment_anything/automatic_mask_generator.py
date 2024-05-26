@@ -6,7 +6,8 @@
 
 import numpy as np
 import torch
-from torchvision.ops.boxes import batched_nms, box_area  # type: ignore
+import types
+from torchvision.ops.boxes import batched_nms, box_area, masks_to_boxes  # type: ignore
 
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -133,7 +134,7 @@ class SamAutomaticMaskGenerator:
         self.min_mask_region_area = min_mask_region_area
         self.output_mode = output_mode
 
-    @torch.no_grad()
+    #@torch.no_grad()
     def generate(self, image: np.ndarray) -> List[Dict[str, Any]]:
         """
         Generates masks for the given image.
@@ -160,7 +161,9 @@ class SamAutomaticMaskGenerator:
         """
 
         # Generate masks
-        mask_data = self._generate_masks(image)
+        for mask_data in self._generate_masks(image):
+            if isinstance(mask_data, torch.Tensor):
+                yield mask_data
 
         # Filter small disconnected regions and holes in masks
         if self.min_mask_region_area > 0:
@@ -192,7 +195,7 @@ class SamAutomaticMaskGenerator:
             }
             curr_anns.append(ann)
 
-        return curr_anns
+        yield curr_anns
 
     def _generate_masks(self, image: np.ndarray) -> MaskData:
         orig_size = image.shape[:2]
@@ -203,7 +206,9 @@ class SamAutomaticMaskGenerator:
         # Iterate over image crops
         data = MaskData()
         for crop_box, layer_idx in zip(crop_boxes, layer_idxs):
-            crop_data = self._process_crop(image, crop_box, layer_idx, orig_size)
+            for crop_data in self._process_crop(image, crop_box, layer_idx, orig_size):
+                if isinstance(crop_data, torch.Tensor):
+                    yield crop_data
             data.cat(crop_data)
 
         # Remove duplicate masks between crops
@@ -220,7 +225,7 @@ class SamAutomaticMaskGenerator:
             data.filter(keep_by_nms)
 
         data.to_numpy()
-        return data
+        yield data
 
     def _process_crop(
         self,
@@ -242,7 +247,8 @@ class SamAutomaticMaskGenerator:
         # Generate masks for this crop in batches
         data = MaskData()
         for (points,) in batch_iterator(self.points_per_batch, points_for_image):
-            batch_data = self._process_batch(points, cropped_im_size, crop_box, orig_size)
+            batch_data, masks = self._process_batch(points, cropped_im_size, crop_box, orig_size)
+            yield masks
             data.cat(batch_data)
             del batch_data
         self.predictor.reset_image()
@@ -261,7 +267,7 @@ class SamAutomaticMaskGenerator:
         data["points"] = uncrop_points(data["points"], crop_box)
         data["crop_boxes"] = torch.tensor([crop_box for _ in range(len(data["rles"]))])
 
-        return data
+        yield data
 
     def _process_batch(
         self,
@@ -282,6 +288,9 @@ class SamAutomaticMaskGenerator:
             multimask_output=True,
             return_logits=True,
         )
+
+        return_masks = masks
+        masks = masks.detach().clone()
 
         # Serialize predictions and store in MaskData
         data = MaskData(
@@ -318,7 +327,7 @@ class SamAutomaticMaskGenerator:
         data["rles"] = mask_to_rle_pytorch(data["masks"])
         del data["masks"]
 
-        return data
+        return data, return_masks
 
     @staticmethod
     def postprocess_small_regions(
